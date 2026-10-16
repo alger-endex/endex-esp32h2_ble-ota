@@ -11,8 +11,8 @@
 
 透過 GitHub Pages 開啟（網址需為 `https://`，Web Bluetooth 才能運作）：
 
-- 更新頁面：`https://<帳號>.github.io/<repo>/ble_ota.html`
-- 操作手冊：`https://<帳號>.github.io/<repo>/`
+- 更新頁面：`https://<帳號>.github.io/<repo>/`（或 `ble_ota.html`）
+- 操作手冊：`https://<帳號>.github.io/<repo>/ota_manual.html`
 
 ## 瀏覽器需求
 
