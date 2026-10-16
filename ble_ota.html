@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 BLE OTA</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #f0f2f5;
+      padding: 24px 16px;
+    }
+    h1 { font-size: 22px; color: #333; margin-bottom: 20px; }
+    .card {
+      background: white;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+    }
+    .card-title { font-weight: 600; font-size: 14px; color: #666; margin-bottom: 12px; }
+    input[type=file] { width: 100%; padding: 8px; border: 2px dashed #ccc; border-radius: 6px; cursor: pointer; }
+    button {
+      background: #1a73e8;
+      color: white;
+      border: none;
+      padding: 12px 28px;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 12px;
+    }
+    button:hover:not(:disabled) { background: #1558b0; }
+    button:disabled { background: #b0c4de; cursor: not-allowed; }
+    .progress-track {
+      background: #e8eaed;
+      border-radius: 6px;
+      height: 18px;
+      overflow: hidden;
+      margin: 10px 0 6px;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #34a853;
+      border-radius: 6px;
+      transition: width 0.15s ease;
+    }
+    .progress-label { font-size: 13px; color: #555; }
+    #log {
+      font-family: 'Cascadia Code', 'Consolas', monospace;
+      font-size: 12.5px;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      padding: 14px;
+      border-radius: 8px;
+      height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.6;
+    }
+    .ok  { color: #a6e3a1; font-weight: bold; }
+    .err { color: #f38ba8; font-weight: bold; }
+    .dim { color: #6c7086; }
+    .ver-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      padding: 8px 0;
+      border-bottom: 1px solid #eee;
+      font-size: 13.5px;
+    }
+    .ver-row:last-of-type { border-bottom: none; }
+    .ver-label { color: #666; flex: none; }
+    .ver-value {
+      font-family: 'Cascadia Code', 'Consolas', monospace;
+      color: #333;
+      text-align: right;
+      word-break: break-all;
+    }
+    .ver-value.dim { color: #999; font-style: italic; }
+    .ver-value.ok  { color: #1a7f4b; font-weight: 600; }
+    .ver-value.err { color: #c0392b; }
+    #btnCheckVer { background: #546e7a; margin-top: 14px; }
+    #btnCheckVer:hover:not(:disabled) { background: #42545c; }
+    #browser-warn {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 13px;
+      margin-bottom: 16px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+<h1>ESP32 BLE OTA 更新</h1>
+<p style="margin:-12px 0 16px;font-size:13px;"><a href="ota_manual.html" target="_blank" rel="noopener">📖 操作手冊與燈號說明</a></p>
+
+<div id="browser-warn">
+  ⚠️ 請使用 <strong>Chrome</strong> 或 <strong>Edge</strong> 瀏覽器，Web Bluetooth 才能運作。
+</div>
+
+<div class="card">
+  <div class="card-title">韌體檔案</div>
+  <input type="file" id="binFile" accept=".bin">
+  <button id="btnOta" onclick="startOTA()">開始 OTA 更新</button>
+</div>
+
+<div class="card">
+  <div class="card-title">版本確認（只讀取，不寫入韌體）</div>
+  <div class="ver-row">
+    <span class="ver-label">更新檔案版本</span>
+    <span id="fileVersion" class="ver-value dim">尚未選擇檔案</span>
+  </div>
+  <div class="ver-row">
+    <span class="ver-label">裝置目前版本</span>
+    <span id="deviceVersion" class="ver-value dim">尚未讀取</span>
+  </div>
+  <button id="btnCheckVer" onclick="checkDeviceVersion()">連線讀取裝置目前版本</button>
+</div>
+
+<div class="card">
+  <div class="card-title">傳輸進度</div>
+  <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+  <div class="progress-label" id="progressLabel">尚未開始</div>
+</div>
+
+<div class="card">
+  <div class="card-title">Log</div>
+  <div id="log"></div>
+</div>
+
+<script>
+  const OTA_SERVICE      = 0xfe00;
+  const OTA_CTRL_UUID    = 0xfe01;
+  const OTA_DATA_UUID    = 0xfe02;
+  const OTA_STATUS_UUID  = 0xfe03;
+  const OTA_VERSION_UUID = 0xfe04;
+  const CHUNK_SIZE      = 490;
+  const CHUNK_DELAY_MS  = 12;
+
+  let bleDevice = null;
+
+  // Check browser support
+  if (!navigator.bluetooth) {
+    document.getElementById('browser-warn').style.display = 'block';
+    document.getElementById('btnOta').disabled = true;
+    document.getElementById('btnCheckVer').disabled = true;
+  }
+
+  function log(msg, cls = '') {
+    const el = document.getElementById('log');
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = msg + '\n';
+    el.appendChild(span);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setProgress(pct, label) {
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressLabel').textContent = label;
+  }
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // esp_app_desc_t 固定內嵌在 .bin 檔案 offset 32 處
+  // (24 bytes esp_image_header_t + 8 bytes 第一個 esp_image_segment_header_t)，
+  // 版本/日期/時間欄位是這個結構裡的固定偏移，不需要真的燒錄就能讀出來。
+  const APP_DESC_OFFSET = 32;
+  const APP_DESC_MAGIC  = 0xABCD5432;
+
+  function parseFirmwareVersion(bytes) {
+    if (bytes.length < APP_DESC_OFFSET + 256 || bytes[0] !== 0xE9) return null; // 0xE9 = esp_image_header_t.magic
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (dv.getUint32(APP_DESC_OFFSET, true) !== APP_DESC_MAGIC) return null;
+
+    const readStr = (relOffset, len) => {
+      const start = APP_DESC_OFFSET + relOffset;
+      const slice = bytes.subarray(start, start + len);
+      const nul = slice.indexOf(0);
+      return new TextDecoder().decode(nul >= 0 ? slice.subarray(0, nul) : slice);
+    };
+    const version = readStr(16, 32);
+    const time    = readStr(80, 16);
+    const date    = readStr(96, 16);
+    return `${version} ${date} ${time}`;
+  }
+
+  document.getElementById('binFile').addEventListener('change', async (e) => {
+    const el   = document.getElementById('fileVersion');
+    const file = e.target.files[0];
+    if (!file) {
+      el.textContent = '尚未選擇檔案';
+      el.className = 'ver-value dim';
+      return;
+    }
+    el.textContent = '解析中 ...';
+    el.className = 'ver-value dim';
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const ver = parseFirmwareVersion(bytes);
+      if (ver) {
+        el.textContent = ver;
+        el.className = 'ver-value';
+      } else {
+        el.textContent = '無法辨識（非標準韌體檔？）';
+        el.className = 'ver-value err';
+      }
+    } catch (err) {
+      el.textContent = `讀取失敗 (${err.message})`;
+      el.className = 'ver-value err';
+    }
+  });
+
+  async function checkDeviceVersion() {
+    const btn = document.getElementById('btnCheckVer');
+    const el  = document.getElementById('deviceVersion');
+    btn.disabled = true;
+    el.textContent = '掃描中 ...';
+    el.className = 'ver-value dim';
+
+    let dev = null;
+    try {
+      dev = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'ENDEX_CAN_' }],
+        optionalServices: [OTA_SERVICE]
+      });
+      const server  = await dev.gatt.connect();
+      const service = await server.getPrimaryService(OTA_SERVICE);
+      const verChar = await service.getCharacteristic(OTA_VERSION_UUID);
+      const val     = await verChar.readValue();
+      el.textContent = new TextDecoder().decode(val);
+      el.className = 'ver-value ok';
+    } catch (err) {
+      el.textContent = `讀取失敗 (${err.message})`;
+      el.className = 'ver-value err';
+    } finally {
+      if (dev && dev.gatt.connected) dev.gatt.disconnect();
+      btn.disabled = false;
+    }
+  }
+
+  async function startOTA() {
+    const btn = document.getElementById('btnOta');
+    btn.disabled = true;
+    document.getElementById('log').innerHTML = '';
+    setProgress(0, '準備中 ...');
+
+    try {
+      // ── Step 1: 讀取韌體 ──────────────────────────────────────────────
+      const fileInput = document.getElementById('binFile');
+      if (!fileInput.files.length) {
+        log('請先選擇 .bin 檔案', 'err');
+        btn.disabled = false;
+        return;
+      }
+      const file = fileInput.files[0];
+      const fw   = new Uint8Array(await file.arrayBuffer());
+      const total = fw.length;
+      const chunks = [];
+      for (let i = 0; i < total; i += CHUNK_SIZE)
+        chunks.push(fw.slice(i, Math.min(i + CHUNK_SIZE, total)));
+
+      log(`韌體 : ${file.name}`);
+      log(`大小  : ${total.toLocaleString()} bytes → ${chunks.length} chunks × ${CHUNK_SIZE} B`);
+
+      // ── Step 2: 掃描並連線 ────────────────────────────────────────────
+      log('\n掃描 ENDEX_CAN_* ...');
+      bleDevice = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'ENDEX_CAN_' }],
+        optionalServices: [OTA_SERVICE]
+      });
+
+      const server = await bleDevice.gatt.connect();
+      log(`已連線 : ${bleDevice.name}`);
+
+      const service  = await server.getPrimaryService(OTA_SERVICE);
+      const ctrlChar = await service.getCharacteristic(OTA_CTRL_UUID);
+      const dataChar = await service.getCharacteristic(OTA_DATA_UUID);
+
+      try {
+        const verChar    = await service.getCharacteristic(OTA_VERSION_UUID);
+        const verVal     = await verChar.readValue();
+        const oldVersion = new TextDecoder().decode(verVal);
+        log(`更新前版本 : ${oldVersion}`, 'dim');
+      } catch (_) {
+        log('更新前版本 : (此韌體較舊，沒有版本讀取特徵值 0xFE04)', 'dim');
+      }
+
+      // ── Step 3: OTA START ─────────────────────────────────────────────
+      log('\n[1/4] 送出 OTA START ...');
+      await ctrlChar.writeValue(new Uint8Array([0x01]));
+      await sleep(500);
+
+      // ── Step 4: 傳送 chunks ───────────────────────────────────────────
+      log(`[2/4] 傳送 ${chunks.length} chunks (chunk=${CHUNK_SIZE}B  delay=${CHUNK_DELAY_MS}ms) ...`);
+      const t0 = Date.now();
+
+      for (let i = 0; i < chunks.length; i++) {
+        await dataChar.writeValueWithoutResponse(chunks[i]);
+
+        const pct  = Math.round((i + 1) * 100 / chunks.length);
+        const sent = Math.min((i + 1) * CHUNK_SIZE, total);
+        setProgress(pct, `${pct}%   ${sent.toLocaleString()} / ${total.toLocaleString()} bytes`);
+        await sleep(CHUNK_DELAY_MS);
+      }
+
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      log(`    傳送完成，耗時 ${elapsed} 秒`);
+
+      // ── Step 5: OTA END ───────────────────────────────────────────────
+      await sleep(1500);
+      log('[3/4] 送出 OTA END ...');
+      try {
+        await ctrlChar.writeValueWithoutResponse(new Uint8Array([0x02]));
+      } catch (_) {
+        try { await ctrlChar.writeValue(new Uint8Array([0x02])); } catch (_) {}
+      }
+      log('      ESP32 重啟中 ...');
+
+      // ── Step 6: 重連並確認 mark_app_valid ────────────────────────────
+      log('\n[4/4] 等待 ESP32 重啟並重新廣播 ...');
+      setProgress(100, '等待 ESP32 重啟 ...');
+      await sleep(8000);
+
+      for (let attempt = 0; attempt < 8; attempt++) {
+        try {
+          log(`    重連嘗試 ${attempt + 1}/8 ...`, 'dim');
+          const srv2     = await bleDevice.gatt.connect();
+          await sleep(1000);
+          if (!bleDevice.gatt.connected) { await sleep(2000); continue; }
+          const svc2     = await srv2.getPrimaryService(OTA_SERVICE);
+          const statChar = await svc2.getCharacteristic(OTA_STATUS_UUID);
+          const val      = await statChar.readValue();
+          const status   = val.getUint8(0);
+
+          if (status === 0x01) {
+            log('\nOTA verified: mark_app_valid ESP_OK', 'ok');
+            log('新韌體已成功驗證並運行！', 'ok');
+            setProgress(100, 'OTA 完成 ✓');
+          } else {
+            log(`\nOTA status: 0x${status.toString(16).padStart(2,'0')} (未驗證)`, 'err');
+            setProgress(100, 'OTA 完成（驗證狀態異常）');
+          }
+
+          try {
+            const verChar = await svc2.getCharacteristic(OTA_VERSION_UUID);
+            const verVal  = await verChar.readValue();
+            const version = new TextDecoder().decode(verVal);
+            log(`更新後版本 : ${version}`, 'dim');
+          } catch (_) {
+            log('更新後版本 : (沒有版本讀取特徵值 0xFE04)', 'dim');
+          }
+          break;
+        } catch (e) {
+          log(`    失敗 (${e.message})，等待 3 秒 ...`, 'dim');
+          await sleep(3000);
+        }
+      }
+
+    } catch (e) {
+      log(`\n錯誤: ${e.message}`, 'err');
+      setProgress(0, '發生錯誤');
+    }
+
+    btn.disabled = false;
+  }
+</script>
+</body>
+</html>
